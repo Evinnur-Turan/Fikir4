@@ -1,0 +1,533 @@
+# -*- coding: utf-8 -*-
+# NOT (Kaggle): Notebook'u çalıştırmadan önce sağ paneldeki "Internet: On" ayarını açın.
+# Aksi halde web scraping ve API testleri internet erişimi olmadığı için başarısız olur.
+#
+# Gerekli kütüphaneler (Kaggle'da yoksa bir hücrede çalıştırın):
+pip install cloudscraper lxml beautifulsoup4 pandas openpyxl pdfplumber
+"""
+Modern ETL (Extract - Transform - Load) Mimarisi
+================================================
+Yerel belgelerden (Excel, CSV, PDF, TXT) ve web kaynaklarından (HTML, JSON/API)
+veri çeker; temizler, standart biçime sokar ve Excel/CSV olarak kaydeder.
+
+Sınıflar (SOLID - Tek Sorumluluk İlkesi):
+    DataExtractor   -> Veriyi okur / çeker
+    DataTransformer -> Veriyi temizler ve standartlaştırır
+    DataSaver       -> Veriyi diske yazar
+    ETLPipeline     -> Üç sınıfı birbirine bağlayan koordinatör
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import unicodedata
+from io import StringIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import cloudscraper
+import pandas as pd
+from bs4 import BeautifulSoup
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError, RequestException, Timeout
+
+# --------------------------------------------------------------------------- #
+# Log ayarları (terminalde anlaşılır Türkçe mesajlar)
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+
+PathLike = Union[str, Path]
+SourceLike = Union[str, Path, StringIO]
+
+
+# =========================================================================== #
+# 1) EXTRACT: Veri çekme
+# =========================================================================== #
+class DataExtractor:
+    """Yerel belgelerden ve web'den ham veri çeken sınıf."""
+
+    def __init__(self, timeout: int = 20) -> None:
+        self.logger = logging.getLogger("Extractor")
+        self.timeout = timeout
+        # cloudscraper: klasik requests yerine bot korumalarını aşabilen oturum
+        self.scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True}
+        )
+
+    # ------------------------- Yerel belgeler ------------------------------ #
+    def read_csv(self, source: SourceLike, **kwargs: Any) -> pd.DataFrame:
+        """CSV dosyasını veya StringIO nesnesini okur."""
+        try:
+            df = pd.read_csv(source, **kwargs)
+            self.logger.info("CSV başarıyla okundu: %d satır, %d sütun.", *df.shape)
+            return df
+        except FileNotFoundError:
+            self.logger.error("CSV dosyası bulunamadı: %s", source)
+        except pd.errors.EmptyDataError:
+            self.logger.error("CSV dosyası boş: %s", source)
+        except pd.errors.ParserError as exc:
+            self.logger.error("CSV biçimi hatalı, ayrıştırılamadı: %s", exc)
+        except UnicodeDecodeError:
+            self.logger.error("CSV karakter kodlaması hatalı. 'encoding' parametresini deneyin.")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("CSV okunurken beklenmeyen hata: %s", exc)
+        return pd.DataFrame()
+
+    def read_excel(self, path: PathLike, sheet_name: Union[str, int] = 0) -> pd.DataFrame:
+        """Excel (.xlsx / .xls) dosyasını okur."""
+        try:
+            df = pd.read_excel(path, sheet_name=sheet_name)
+            self.logger.info("Excel başarıyla okundu: %d satır, %d sütun.", *df.shape)
+            return df
+        except FileNotFoundError:
+            self.logger.error("Excel dosyası bulunamadı: %s", path)
+        except ValueError as exc:
+            self.logger.error("Excel sayfası veya biçimi hatalı: %s", exc)
+        except ImportError:
+            self.logger.error("Excel okumak için 'openpyxl' kurulu olmalı: pip install openpyxl")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Excel okunurken beklenmeyen hata: %s", exc)
+        return pd.DataFrame()
+
+    def read_txt(
+        self,
+        source: SourceLike,
+        separator: str = ",",
+        has_header: bool = True,
+    ) -> pd.DataFrame:
+        """Ayraçla ayrılmış TXT dosyasını veya StringIO nesnesini DataFrame'e çevirir."""
+        try:
+            if isinstance(source, StringIO):
+                source.seek(0)
+                text = source.read()
+            else:
+                text = Path(source).read_text(encoding="utf-8")
+
+            if not text.strip():
+                self.logger.error("TXT içeriği boş.")
+                return pd.DataFrame()
+
+            df = pd.read_csv(
+                StringIO(text),
+                sep=separator,
+                header=0 if has_header else None,
+                skipinitialspace=True,
+            )
+            self.logger.info("TXT başarıyla okundu: %d satır, %d sütun.", *df.shape)
+            return df
+        except FileNotFoundError:
+            self.logger.error("TXT dosyası bulunamadı: %s", source)
+        except pd.errors.ParserError as exc:
+            self.logger.error("TXT biçimi hatalı, ayrıştırılamadı: %s", exc)
+        except UnicodeDecodeError:
+            self.logger.error("TXT dosyası UTF-8 değil; farklı bir kodlama gerekebilir.")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("TXT okunurken beklenmeyen hata: %s", exc)
+        return pd.DataFrame()
+
+    def read_pdf(self, path: PathLike) -> pd.DataFrame:
+        """PDF içindeki tabloları çıkarır; tablo yoksa sayfa metnini satır satır alır."""
+        try:
+            import pdfplumber  # geç içe aktarma: yalnızca PDF okunurken gerekir
+        except ImportError:
+            self.logger.error("PDF okumak için 'pdfplumber' gerekli: pip install pdfplumber")
+            return pd.DataFrame()
+
+        try:
+            rows: List[List[Optional[str]]] = []
+            text_lines: List[str] = []
+            with pdfplumber.open(str(path)) as pdf:
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    tables = page.extract_tables()
+                    if tables:
+                        for table in tables:
+                            rows.extend(table)
+                        self.logger.info("PDF sayfa %d: %d tablo bulundu.", page_no, len(tables))
+                    else:
+                        text = page.extract_text() or ""
+                        text_lines.extend(line for line in text.splitlines() if line.strip())
+
+            if rows:
+                header, *body = rows
+                return pd.DataFrame(body, columns=header)
+            if text_lines:
+                self.logger.warning("PDF'te tablo bulunamadı; düz metin satırları alındı.")
+                return pd.DataFrame({"metin": text_lines})
+
+            self.logger.error("PDF'ten okunabilir içerik çıkarılamadı (taranmış görsel olabilir).")
+        except FileNotFoundError:
+            self.logger.error("PDF dosyası bulunamadı: %s", path)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("PDF okunurken hata (dosya bozuk olabilir): %s", exc)
+        return pd.DataFrame()
+
+    # ----------------------------- Web ------------------------------------- #
+    def _get_response(self, url: str):
+        """cloudscraper ile GET isteği atar; hataları Türkçe loglar."""
+        try:
+            response = self.scraper.get(url, timeout=self.timeout)
+            response.raise_for_status()
+            return response
+        except Timeout:
+            self.logger.error("Zaman aşımı: %s adresi %d sn içinde yanıt vermedi.", url, self.timeout)
+        except RequestsConnectionError:
+            self.logger.error("İnternet bağlantısı kurulamadı. Kaggle'da 'Internet: On' açık mı?")
+        except HTTPError as exc:
+            self.logger.error("Sunucu hata döndürdü (HTTP %s): %s", exc.response.status_code, url)
+        except RequestException as exc:
+            self.logger.error("İstek sırasında hata oluştu: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Beklenmeyen ağ hatası: %s", exc)
+        return None
+
+    def fetch_json(self, url: str) -> pd.DataFrame:
+        """JSON/API uç noktasından veri çeker ve DataFrame'e dönüştürür."""
+        response = self._get_response(url)
+        if response is None:
+            return pd.DataFrame()
+        try:
+            data = response.json()
+            df = pd.json_normalize(data)
+            self.logger.info("API verisi alındı: %d satır, %d sütun.", *df.shape)
+            return df
+        except ValueError:
+            self.logger.error("Yanıt geçerli bir JSON değil: %s", url)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("JSON işlenirken hata: %s", exc)
+        return pd.DataFrame()
+
+    def scrape_html_table(self, url: str, table_index: int = 0) -> pd.DataFrame:
+        """Sayfadaki HTML <table> öğesini lxml ayrıştırıcısıyla DataFrame'e çevirir."""
+        response = self._get_response(url)
+        if response is None:
+            return pd.DataFrame()
+        try:
+            soup = BeautifulSoup(response.text, "lxml")
+            tables = soup.find_all("table")
+            if not tables:
+                self.logger.error("Sayfada hiç <table> etiketi bulunamadı: %s", url)
+                return pd.DataFrame()
+            if table_index >= len(tables):
+                self.logger.error(
+                    "İstenen tablo (%d) yok; sayfada %d tablo var.", table_index, len(tables)
+                )
+                return pd.DataFrame()
+
+            table = tables[table_index]
+            header_cells = table.find_all("th")
+            headers = [th.get_text(strip=True) for th in header_cells]
+
+            rows: List[List[str]] = []
+            for tr in table.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if cells:
+                    rows.append(cells)
+
+            if not rows:
+                self.logger.error("Tabloda veri satırı bulunamadı (eksik HTML etiketleri olabilir).")
+                return pd.DataFrame()
+
+            width = max(len(r) for r in rows)
+            rows = [r + [""] * (width - len(r)) for r in rows]  # eksik hücreleri doldur
+            if len(headers) != width:
+                self.logger.warning("Başlık sayısı sütun sayısıyla uyuşmuyor; otomatik adlandırılıyor.")
+                headers = [f"sutun_{i + 1}" for i in range(width)]
+
+            df = pd.DataFrame(rows, columns=headers)
+            self.logger.info("HTML tablosu çekildi: %d satır, %d sütun.", *df.shape)
+            return df
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("HTML ayrıştırılırken hata: %s", exc)
+        return pd.DataFrame()
+
+    def scrape_html_elements(self, url: str, selectors: Dict[str, str]) -> pd.DataFrame:
+        """
+        CSS seçicilerle sayfadan sütun sütun veri çeker.
+        Örnek: {"baslik": "h2.title", "fiyat": "span.price"}
+        """
+        response = self._get_response(url)
+        if response is None:
+            return pd.DataFrame()
+        try:
+            soup = BeautifulSoup(response.text, "lxml")
+            columns: Dict[str, List[str]] = {}
+            for name, selector in selectors.items():
+                found = [el.get_text(strip=True) for el in soup.select(selector)]
+                if not found:
+                    self.logger.warning("'%s' seçicisi (%s) için öğe bulunamadı.", name, selector)
+                columns[name] = found
+
+            if not any(columns.values()):
+                self.logger.error("Hiçbir seçici veri döndürmedi.")
+                return pd.DataFrame()
+
+            return pd.DataFrame({k: pd.Series(v, dtype="object") for k, v in columns.items()})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("HTML öğeleri çekilirken hata: %s", exc)
+        return pd.DataFrame()
+
+
+# =========================================================================== #
+# 2) TRANSFORM: Temizleme ve standartlaştırma
+# =========================================================================== #
+class DataTransformer:
+    """Boşlukları temizler, sütun adlarını standartlaştırır, veri tiplerini düzenler."""
+
+    # Türkçe karakterleri ASCII karşılıklarına çevirir
+    _TR_MAP = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+
+    def __init__(self, case_style: str = "snake") -> None:
+        """case_style: 'snake' (snake_case) veya 'upper' (UPPERCASE)."""
+        if case_style not in {"snake", "upper"}:
+            raise ValueError("case_style yalnızca 'snake' veya 'upper' olabilir.")
+        self.case_style = case_style
+        self.logger = logging.getLogger("Transformer")
+
+    def _standardize_name(self, name: Any) -> str:
+        text = str(name).translate(self._TR_MAP)
+        text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        text = re.sub(r"[^0-9a-zA-Z]+", "_", text).strip("_").lower()
+        text = text or "bos_sutun"
+        return text.upper() if self.case_style == "upper" else text
+
+    def standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Sütun adlarını standart biçime çevirir; çakışanlara sıra numarası ekler."""
+        new_names: List[str] = []
+        seen: Dict[str, int] = {}
+        for col in df.columns:
+            base = self._standardize_name(col)
+            if base in seen:
+                seen[base] += 1
+                base = f"{base}_{seen[base]}"
+            else:
+                seen[base] = 0
+            new_names.append(base)
+        df = df.copy()
+        df.columns = new_names
+        self.logger.info("Sütun adları standartlaştırıldı: %s", new_names)
+        return df
+
+    def clean_whitespace(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Metin hücrelerindeki baş/son/çoklu boşlukları temizler; boş metinleri NaN yapar."""
+        df = df.copy()
+        for col in df.select_dtypes(include=["object", "string"]).columns:
+            df[col] = (
+                df[col]
+                .astype("string")
+                .str.replace(r"\s+", " ", regex=True)
+                .str.strip()
+                .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "null": pd.NA})
+            )
+        self.logger.info("Metin sütunlarındaki gereksiz boşluklar temizlendi.")
+        return df
+
+    def drop_empty_and_duplicates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Tamamen boş satır/sütunları ve tekrar eden satırları kaldırır."""
+        before = len(df)
+        df = df.dropna(how="all").dropna(axis=1, how="all")
+        df = df.drop_duplicates().reset_index(drop=True)
+        self.logger.info("Boş/tekrarlı satırlar temizlendi: %d -> %d satır.", before, len(df))
+        return df
+
+    def convert_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Sayısal görünen metinleri sayıya, tarih sütunlarını datetime'a çevirir."""
+        df = df.copy()
+        for col in df.columns:
+            if not pd.api.types.is_object_dtype(df[col]) and not pd.api.types.is_string_dtype(df[col]):
+                continue
+
+            non_null = df[col].dropna()
+            if non_null.empty:
+                continue
+
+            # 1) Sayıya çevirmeyi dene (%80 ve üzeri başarılıysa kabul et)
+            numeric = pd.to_numeric(non_null.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+            if numeric.notna().mean() >= 0.8:
+                df[col] = pd.to_numeric(
+                    df[col].astype("string").str.replace(",", ".", regex=False), errors="coerce"
+                )
+                continue
+
+            # 2) Tarih sütunu mu? (adında tarih ipucu varsa dene)
+            if any(hint in col.lower() for hint in ("tarih", "date", "time", "zaman")):
+                parsed = pd.to_datetime(non_null, errors="coerce")
+                if parsed.notna().mean() >= 0.8:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        self.logger.info("Veri tipleri düzenlendi.")
+        return df
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Tüm dönüşüm adımlarını sırayla uygular."""
+        if df is None or df.empty:
+            self.logger.warning("Dönüştürülecek veri yok (DataFrame boş).")
+            return pd.DataFrame()
+        try:
+            df = self.clean_whitespace(df)
+            df = self.standardize_columns(df)
+            df = self.drop_empty_and_duplicates(df)
+            df = self.convert_types(df)
+            self.logger.info("Dönüşüm tamamlandı: %d satır, %d sütun.", *df.shape)
+            return df
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Dönüşüm sırasında beklenmeyen hata: %s", exc)
+            return pd.DataFrame()
+
+
+# =========================================================================== #
+# 3) LOAD: Diske yazma
+# =========================================================================== #
+class DataSaver:
+    """Temizlenmiş veriyi Excel veya CSV olarak diske yazar."""
+
+    def __init__(self, output_dir: PathLike = "output") -> None:
+        self.logger = logging.getLogger("Saver")
+        self.output_dir = Path(output_dir)
+
+    def _prepare_dir(self) -> bool:
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            return True
+        except OSError as exc:
+            self.logger.error("Çıktı klasörü oluşturulamadı (%s): %s", self.output_dir, exc)
+            return False
+
+    def save_csv(self, df: pd.DataFrame, filename: str) -> Optional[Path]:
+        """CSV olarak kaydeder (Excel'de Türkçe karakterler için utf-8-sig)."""
+        if df.empty:
+            self.logger.warning("Kaydedilecek veri yok; CSV oluşturulmadı: %s", filename)
+            return None
+        if not self._prepare_dir():
+            return None
+        path = self.output_dir / filename
+        try:
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            self.logger.info("CSV kaydedildi: %s", path)
+            return path
+        except PermissionError:
+            self.logger.error("Yazma izni yok veya dosya açık: %s", path)
+        except OSError as exc:
+            self.logger.error("CSV yazılırken disk hatası: %s", exc)
+        return None
+
+    def save_excel(self, df: pd.DataFrame, filename: str, sheet_name: str = "Veri") -> Optional[Path]:
+        """Excel (.xlsx) olarak kaydeder."""
+        if df.empty:
+            self.logger.warning("Kaydedilecek veri yok; Excel oluşturulmadı: %s", filename)
+            return None
+        if not self._prepare_dir():
+            return None
+        path = self.output_dir / filename
+        try:
+            df.to_excel(path, index=False, sheet_name=sheet_name, engine="openpyxl")
+            self.logger.info("Excel kaydedildi: %s", path)
+            return path
+        except ImportError:
+            self.logger.error("Excel yazmak için 'openpyxl' gerekli: pip install openpyxl")
+        except PermissionError:
+            self.logger.error("Yazma izni yok veya dosya açık: %s", path)
+        except OSError as exc:
+            self.logger.error("Excel yazılırken disk hatası: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Excel yazılırken beklenmeyen hata: %s", exc)
+        return None
+
+
+# =========================================================================== #
+# Koordinatör: Extract -> Transform -> Load
+# =========================================================================== #
+class ETLPipeline:
+    """Üç bileşeni bağımlılık enjeksiyonu ile alıp akışı yönetir (DIP)."""
+
+    def __init__(
+        self,
+        extractor: DataExtractor,
+        transformer: DataTransformer,
+        saver: DataSaver,
+    ) -> None:
+        self.extractor = extractor
+        self.transformer = transformer
+        self.saver = saver
+        self.logger = logging.getLogger("Pipeline")
+
+    def run(
+        self,
+        raw_df: pd.DataFrame,
+        name: str,
+        save_csv: bool = True,
+        save_excel: bool = True,
+    ) -> pd.DataFrame:
+        """Hazır çekilmiş ham veriyi dönüştürür ve kaydeder."""
+        self.logger.info("=== '%s' işlemi başladı ===", name)
+        clean_df = self.transformer.transform(raw_df)
+        if clean_df.empty:
+            self.logger.warning("'%s' için temiz veri üretilemedi; kayıt atlandı.", name)
+            return clean_df
+        if save_csv:
+            self.saver.save_csv(clean_df, f"{name}.csv")
+        if save_excel:
+            self.saver.save_excel(clean_df, f"{name}.xlsx")
+        self.logger.info("=== '%s' işlemi bitti ===", name)
+        return clean_df
+
+
+# =========================================================================== #
+# Test Senaryosu (GitHub / Kaggle)
+# =========================================================================== #
+if __name__ == "__main__":
+    extractor = DataExtractor(timeout=20)
+    transformer = DataTransformer(case_style="snake")  # "upper" yaparak BÜYÜK HARF deneyebilirsiniz
+    saver = DataSaver(output_dir="output")
+    pipeline = ETLPipeline(extractor, transformer, saver)
+
+    # ---- TEST 1: Ücretsiz API (JSON) --------------------------------------
+    print("\n" + "#" * 60)
+    print("TEST 1: JSONPlaceholder API'sinden veri çekme")
+    print("#" * 60)
+    api_raw = extractor.fetch_json("https://jsonplaceholder.typicode.com/users")
+    api_clean = pipeline.run(api_raw, name="api_kullanicilar")
+    if not api_clean.empty:
+        print(api_clean.head())
+        print(api_clean.dtypes)
+
+    # ---- TEST 2: Sahte yerel CSV (StringIO) -------------------------------
+    print("\n" + "#" * 60)
+    print("TEST 2: StringIO ile sahte CSV belgesini okuma")
+    print("#" * 60)
+    fake_csv = StringIO(
+        "Ad Soyad ,  Şehir,Yaş,Maaş (TL),Kayıt Tarihi\n"
+        "  Ayşe   Yılmaz ,İzmir,25,\"15000,50\",2024-01-15\n"
+        "Mehmet Öztürk,  Ankara ,31,18250,2024-02-20\n"
+        "Mehmet Öztürk,  Ankara ,31,18250,2024-02-20\n"
+        "Zeynep   Çelik,İstanbul,,21000,2024-03-05\n"
+        ",,,,\n"
+    )
+    csv_raw = extractor.read_csv(fake_csv)
+    csv_clean = pipeline.run(csv_raw, name="yerel_csv_test")
+    if not csv_clean.empty:
+        print(csv_clean)
+        print(csv_clean.dtypes)
+
+    # ---- TEST 3: Sahte yerel TXT (StringIO) -------------------------------
+    print("\n" + "#" * 60)
+    print("TEST 3: StringIO ile sahte TXT belgesini okuma")
+    print("#" * 60)
+    fake_txt = StringIO(
+        "Ürün Adı;Fiyat;Stok Durumu\n"
+        "  Klavye ;350,75; Var\n"
+        "Fare;120;Yok\n"
+        " Monitör ;2450,00;Var\n"
+    )
+    txt_raw = extractor.read_txt(fake_txt, separator=";")
+    txt_clean = pipeline.run(txt_raw, name="yerel_txt_test")
+    if not txt_clean.empty:
+        print(txt_clean)
+        print(txt_clean.dtypes)
+
+    print("\nTüm testler tamamlandı. Çıktılar 'output' klasöründe.")
